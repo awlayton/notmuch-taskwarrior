@@ -51,9 +51,9 @@ ERR=$(mktemp)
 cat >"$FAKE_BIN/notmuch" <<'BASH'
 #!/usr/bin/env bash
 # Fake notmuch for tests. The subcommand is read off $1, so the same fake
-# serves a --version check, a search snapshot, per-id show enrichment (for
-# the init-age / description / state-tag paths), and tag writes in the same
-# on-launch / on-modify pass.
+# serves a --version check, a search snapshot (now thread-mode), per-thread
+# show enrichment (for the init-age / description / state-tag paths), and
+# tag writes in the same on-launch / on-modify pass.
 set -u
 if [ "${1:-}" = "--version" ]; then
     echo "notmuch 0.40 (fake for tests)"
@@ -63,101 +63,107 @@ fi
 cmd="${1:-}"
 case "$cmd" in
     search)
-        # args: --output=messages --format=json <query> -- the query is the
-        # only positional token, so drive distinct canned ids per query.
+        # args: --output=threads|messages --format=json <query>
+        # --output is honored so the same fake supports both shapes
+        # (production is thread-mode; tests of legacy callers can use
+        # --output=messages if needed).
+        out_kind="messages"
         query=""
         for arg in "$@"; do
             case "$arg" in
-                --output=messages | --format=json) ;;
+                --output=*) out_kind="${arg#--output=}" ;;
+                --format=json) ;;
                 *) query="$arg" ;;
             esac
         done
-        case "$query" in
-            "tag:waiting-for")
-                # The multi-config test's second query returns the WAITING
-                # family so each config gets its own snapshot.
-                printf '["waiting-1@host","waiting-2@host"]\n'
+        case "$out_kind:$query" in
+            threads:tag:waiting-for)
+                printf '["t3","t4"]\n'
                 ;;
-            "tag:acme-source")
-                # The project-tag override test's query returns a single
-                # message whose only project:* tag is `project:acme`.
-                printf '["proj1@host"]\n'
+            threads:tag:acme-source)
+                printf '["t5"]\n'
                 ;;
-            "tag:no-proj")
-                # The no-match test's query returns a message with no
-                # project:* tags, so the literal $project fallback wins.
-                printf '["proj3@host"]\n'
+            threads:tag:no-proj)
+                printf '["t7"]\n'
                 ;;
-            "tag:mixed")
-                # The alphabetical-first test's query returns a message
-                # carrying BOTH project:beta and project:alpha, so the
-                # alphabetical-first selection is observable.
-                printf '["proj2@host"]\n'
+            threads:tag:mixed)
+                printf '["t6"]\n'
                 ;;
-            *)
-                # Default: every other query (including tag:todo) returns
-                # the MSGID family so existing tests keep working.
+            threads:"tag:threaded")
+                # Multi-message-thread test: one thread, three messages.
+                # The test asserts only ONE task is created from this.
+                printf '["t8"]\n'
+                ;;
+            threads:*) # default (tag:todo + anything else)
+                printf '["t1","t2"]\n'
+                ;;
+            messages:*) # optional legacy mode for future tests
                 printf '["msgid-1@host","msgid-2@host"]\n'
                 ;;
         esac
         ;;
     show)
-        # args: --format=json id:<bare-id>
+        # args: --format=json (id|thread):<key>
+        # Modern call path is `thread:<tid>` (thread-mode mirroring);
+        # `id:<bare-id>` is preserved for direct callers.
         id=""
+        thread=""
         for arg in "$@"; do
             case "$arg" in
                 id:*) id="${arg#id:}" ;;
+                thread:*) thread="${arg#thread:}" ;;
             esac
         done
-        # Per-id canned headers. Dates are +0000 so the conversion to TW
-        # compact UTC is identity (no TZ math). msgid-2@host deliberately
-        # carries the task-done tag so the "does NOT push state" test can
-        # expose a notmuch->TW state mismatch.
-        case "$id" in
-            msgid-1@host)
-                # Mirror real notmuch 0.40 single-id show shape: subject and
-                # authors are at the top level as null/unset; the actual Subject
-                # and From live inside headers. (When tested against real
-                # notmuch, top-level .subject was null and only headers.Subject
-                # carried the value - the lib's filter falls back to
-                # headers.Subject.)
+        # In thread-mode we route through the thread-id; in id-mode through
+        # the bare message-id (which also resolves to its owning thread for
+        # backwards-compat callers).
+        chosen="$thread"
+        [ -z "$chosen" ] && chosen="$id"
+        case "$chosen" in
+            t1|msgid-1@host)
                 cat <<'JSON'
-[[{"id":"msgid-1@host","thread":"t1","timestamp":1579084200,"date_relative":"2020-01-15","subject":null,"authors":null,"tags":["todo"],"headers":{"Subject":"Fix the frobnicator","From":"ada@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
+[[{"id":"msgid-1@host","timestamp":1579084200,"date_relative":"2020-01-15","subject":null,"authors":null,"tags":["todo"],"headers":{"Subject":"Fix the frobnicator","From":"ada@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
 JSON
                 ;;
-            msgid-2@host)
+            t2|msgid-2@host)
+                # t2 carries the task-done tag so the "does NOT push state"
+                # test exposes a notmuch->TW state mismatch.
                 cat <<'JSON'
-[[{"id":"msgid-2@host","thread":"t2","timestamp":1559386800,"date_relative":"2019-06-01","subject":null,"authors":null,"tags":["task-done"],"headers":{"Subject":"Document the widget","From":"bob@example.com","Date":"Sat, 01 Jun 2019 08:00:00 +0000"}}]]
+[[{"id":"msgid-2@host","timestamp":1559386800,"date_relative":"2019-06-01","subject":null,"authors":null,"tags":["task-done"],"headers":{"Subject":"Document the widget","From":"bob@example.com","Date":"Sat, 01 Jun 2019 08:00:00 +0000"}}]]
 JSON
                 ;;
-            waiting-1@host)
+            t3|waiting-1@host)
                 cat <<'JSON'
-[[{"id":"waiting-1@host","thread":"t3","timestamp":1583816400,"date_relative":"2020-03-10","subject":null,"authors":null,"tags":["waiting-for"],"headers":{"Subject":"Waiting item one","From":"carol@example.com","Date":"Tue, 10 Mar 2020 09:00:00 +0000"}}]]
+[[{"id":"waiting-1@host","timestamp":1583816400,"date_relative":"2020-03-10","subject":null,"authors":null,"tags":["waiting-for"],"headers":{"Subject":"Waiting item one","From":"carol@example.com","Date":"Tue, 10 Mar 2020 09:00:00 +0000"}}]]
 JSON
                 ;;
-            waiting-2@host)
+            t4|waiting-2@host)
                 cat <<'JSON'
-[[{"id":"waiting-2@host","thread":"t4","timestamp":1587380400,"date_relative":"2020-04-20","subject":null,"authors":null,"tags":["waiting-for"],"headers":{"Subject":"Waiting item two","From":"dave@example.com","Date":"Mon, 20 Apr 2020 11:00:00 +0000"}}]]
+[[{"id":"waiting-2@host","timestamp":1587380400,"date_relative":"2020-04-20","subject":null,"authors":null,"tags":["waiting-for"],"headers":{"Subject":"Waiting item two","From":"dave@example.com","Date":"Mon, 20 Apr 2020 11:00:00 +0000"}}]]
 JSON
                 ;;
-            proj1@host)
-                # Single project:acme tag, plus the trigger. project_tag_prefix
-                # test 1: tag wins over the literal $project=fallback-literal.
+            t5|proj1@host)
                 cat <<'JSON'
-[[{"id":"proj1@host","thread":"t5","timestamp":1579084200,"subject":null,"authors":null,"tags":["todo","project:acme"],"headers":{"Subject":"Acme item","From":"acme@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
+[[{"id":"proj1@host","timestamp":1579084200,"subject":null,"authors":null,"tags":["todo","project:acme"],"headers":{"Subject":"Acme item","From":"acme@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
 JSON
                 ;;
-            proj2@host)
-                # Two project:* tags out of order so the alphabetical-first
-                # selection is observable.
+            t6|proj2@host)
                 cat <<'JSON'
-[[{"id":"proj2@host","thread":"t6","timestamp":1579084200,"subject":null,"authors":null,"tags":["todo","project:beta","project:alpha"],"headers":{"Subject":"Mixed item","From":"m@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
+[[{"id":"proj2@host","timestamp":1579084200,"subject":null,"authors":null,"tags":["todo","project:beta","project:alpha"],"headers":{"Subject":"Mixed item","From":"m@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
 JSON
                 ;;
-            proj3@host)
-                # No project:* tags at all. Test 2: literal $project applies.
+            t7|proj3@host)
                 cat <<'JSON'
-[[{"id":"proj3@host","thread":"t7","timestamp":1579084200,"subject":null,"authors":null,"tags":["todo"],"headers":{"Subject":"Plain item","From":"p@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
+[[{"id":"proj3@host","timestamp":1579084200,"subject":null,"authors":null,"tags":["todo"],"headers":{"Subject":"Plain item","From":"p@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}}]]
+JSON
+                ;;
+            t8)
+                # Thread with 3 messages (root + 2 replies). The lib's filter
+                # picks the first 'first' message via `..|objects..` - here
+                # it's the root. Test asserts ONE task is created from
+                # this thread, regardless of the reply count.
+                cat <<'JSON'
+[[{"id":"threaded-root@host","timestamp":1579084200,"subject":null,"authors":null,"tags":["todo"],"headers":{"Subject":"Threaded: root message","From":"root@example.com","Date":"Wed, 15 Jan 2020 10:30:00 +0000"}},[{"id":"threaded-reply1@host","timestamp":1579087800,"subject":null,"authors":null,"tags":[],"headers":{"Subject":"Re: Threaded","From":"reply1@example.com","Date":"Wed, 15 Jan 2020 11:30:00 +0000"}},{"id":"threaded-reply2@host","timestamp":1579091400,"subject":null,"authors":null,"tags":[],"headers":{"Subject":"Re: Threaded","From":"reply2@example.com","Date":"Wed, 15 Jan 2020 12:30:00 +0000"}}]]]
 JSON
                 ;;
             *)
@@ -185,6 +191,8 @@ hooks.location=$HOOKS_DIR
 data.location=$TASKDATA
 uda.notmuchid.type=string
 uda.notmuchid.label=Notmuch Message-ID
+uda.notmuchthreadid.type=string
+uda.notmuchthreadid.label=Notmuch Thread-ID
 uda.notmuchstate.type=string
 uda.notmuchstate.label=Notmuch State
 uda.notmuchmsgid.type=string
@@ -239,10 +247,13 @@ test_launch_adds_new() {
   bash "$HOOKS_DIR/on-launch.notmuch-task" >/dev/null 2>&1 || return 1
   tx | jq -e 'length == 2' >/dev/null || return 1
   tx | jq -e '[.[] | select(.notmuchid != null)] | length == 2' >/dev/null || return 1
+  tx | jq -e '[.[] | select(.notmuchthreadid != null)] | length == 2' >/dev/null || return 1
   tx | jq -e '[.[] | select(.notmuchstate != null)] | length == 2' >/dev/null || return 1
   tx | jq -e '[.[] | select(.project == "notmuch")] | length == 2' >/dev/null || return 1
-  # msgid-1: subject becomes description, full id lands in notmuchmsgid.
-  tx | jq -e '.[] | select(.notmuchid == "msgid-1@host") | .status == "pending" and .description == "Fix the frobnicator" and .notmuchmsgid == "<msgid-1@host>" and .notmuchstate == "task-pending"' >/dev/null || return 1
+  # msgid-1 thread (t1): subject becomes description; root msg-id lands in
+  # notmuchid; thread-id lands in notmuchthreadid; full id lands in
+  # notmuchmsgid; notmuchstate records the initial state.
+  tx | jq -e '.[] | select(.notmuchid == "msgid-1@host") | .status == "pending" and .description == "Fix the frobnicator" and .notmuchmsgid == "<msgid-1@host>" and .notmuchthreadid == "t1" and .notmuchstate == "task-pending"' >/dev/null || return 1
   return 0
 }
 
@@ -250,13 +261,15 @@ test_launch_creates_task_with_deterministic_uuid() {
   command -v md5sum >/dev/null 2>&1 || { echo "SKIP: md5sum not found"; return 0; }
   fresh_tasks
   local uuid_1 uuid_2 actual_1 actual_2
-  uuid_1=$(bash -c "source '$REPO_DIR/hooks/notmuch-task/lib/notmuch-task-lib.bash'; notmuch_task::msgid_to_uuid msgid-1@host") || return 1
-  uuid_2=$(bash -c "source '$REPO_DIR/hooks/notmuch-task/lib/notmuch-task-lib.bash'; notmuch_task::msgid_to_uuid msgid-2@host") || return 1
+  # UUID is now derived from the THREAD id (one task per matching thread),
+  # not the message id - so the seed values are t1 and t2.
+  uuid_1=$(bash -c "source '$REPO_DIR/hooks/notmuch-task/lib/notmuch-task-lib.bash'; notmuch_task::msgid_to_uuid t1") || return 1
+  uuid_2=$(bash -c "source '$REPO_DIR/hooks/notmuch-task/lib/notmuch-task-lib.bash'; notmuch_task::msgid_to_uuid t2") || return 1
   bash "$HOOKS_DIR/on-launch.notmuch-task" >/dev/null 2>&1 || return 1
   actual_1=$(tx | jq -r '.[] | select(.notmuchid == "msgid-1@host") | .uuid')
   actual_2=$(tx | jq -r '.[] | select(.notmuchid == "msgid-2@host") | .uuid')
-  [ "$actual_1" = "$uuid_1" ] || { echo "want msgid-1 uuid=$uuid_1 got $actual_1" >&2; return 1; }
-  [ "$actual_2" = "$uuid_2" ] || { echo "want msgid-2 uuid=$uuid_2 got $actual_2" >&2; return 1; }
+  [ "$actual_1" = "$uuid_1" ] || { echo "want t1 uuid=$uuid_1 got $actual_1" >&2; return 1; }
+  [ "$actual_2" = "$uuid_2" ] || { echo "want t2 uuid=$uuid_2 got $actual_2" >&2; return 1; }
   return 0
 }
 
@@ -267,10 +280,11 @@ test_launch_reimport_yields_same_uuid() {
   local u1 u2
   u1=$(tx | jq -r '.[] | select(.notmuchid == "msgid-1@host") | .uuid')
   [ -n "$u1" ] || return 1
-  # Delete the msgid-1 task so the next on-launch pass sees it as a matched
-  # deleted task. The deterministic UUID must survive (never clobbered, never
-  # re-created with a different id). Pipe "y" into the delete so TW's
-  # interactive prompt is satisfied when running under a non-TTY test harness.
+  # Delete the msgid-1 (root of t1) task so the next on-launch pass sees
+  # it as a matched deleted task. The deterministic UUID (derived from
+  # the thread id) must survive - never clobbered, never re-created with
+  # a different id. Pipe "y" into the delete so TW's interactive prompt
+  # is satisfied when running under a non-TTY test harness.
   yes y | t "$u1" delete >/dev/null 2>&1 || return 1
   bash "$HOOKS_DIR/on-launch.notmuch-task" >/dev/null 2>&1 || return 1
   u2=$(tx | jq -r '.[] | select(.notmuchid == "msgid-1@host") | .uuid')
@@ -280,7 +294,10 @@ test_launch_reimport_yields_same_uuid() {
 
 test_launch_reconciles_description() {
   fresh_tasks
-  t add notmuchid:msgid-1@host description:Old >/dev/null 2>&1 || return 1
+  # Pre-create a mirror task with both thread-id (the on-launch matching
+  # key) and a stale description. The hook must reconcile the description
+  # to the email Subject.
+  t add notmuchthreadid:t1 notmuchid:msgid-1@host description:Old >/dev/null 2>&1 || return 1
   bash "$HOOKS_DIR/on-launch.notmuch-task" >/dev/null 2>&1 || return 1
   # The Subject wins (sync_description_on_launch=1 default).
   tx | jq -e '.[] | select(.notmuchid == "msgid-1@host") | .description == "Fix the frobnicator"' >/dev/null || return 1
@@ -291,13 +308,15 @@ test_launch_reconciles_description() {
 
 test_launch_does_not_push_state() {
   fresh_tasks
-  # msgid-2@host carries the task-done tag in the fake show output, so
-  # notmuch's implied state is "completed" while the TW task is pending.
-  # on-launch must NOT push that state back; it only logs a soft warning.
-  t add notmuchid:msgid-2@host description:"Document the widget" >/dev/null 2>&1 || return 1
+  # Pre-create mirror tasks for both threads so on-launch reconciles
+  # rather than imports. Each thread's root msg carries a specific tag
+  # pattern: t2's root has task-done so the notmuch->TW implied state is
+  # "completed" while the TW task stays pending. on-launch must NOT push
+  # that state back; it logs a soft warning instead.
+  t add notmuchthreadid:t1 notmuchid:msgid-1@host description:"Fix the frobnicator" >/dev/null 2>&1 || return 1
+  t add notmuchthreadid:t2 notmuchid:msgid-2@host description:"Document the widget" >/dev/null 2>&1 || return 1
   bash "$HOOKS_DIR/on-launch.notmuch-task" >/dev/null 2>&1 || return 1
   tx | jq -e '.[] | select(.notmuchid == "msgid-2@host") | .status == "pending"' >/dev/null || return 1
-  # msgid-1@host was unmatched and still imported alongside.
   tx | jq -e '.[] | select(.notmuchid == "msgid-1@host") | .status == "pending"' >/dev/null || return 1
   return 0
 }

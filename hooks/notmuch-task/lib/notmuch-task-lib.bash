@@ -140,6 +140,7 @@ notmuch_task::set_config_defaults() {
   project_tag_prefix=""
   query="tag:todo"
   notmuchid_uda="notmuchid"
+  notmuchthreadid_uda="notmuchthreadid"
   notmuchstate_uda="notmuchstate"
   notmuchmsgid_uda="notmuchmsgid"
   trigger_tag="todo"
@@ -187,7 +188,7 @@ notmuch_task::source_config_file() {
 
   # Re-export so per-config values are visible to the calling hook.
   export project project_tag_prefix query
-  export notmuchid_uda notmuchstate_uda notmuchmsgid_uda
+  export notmuchid_uda notmuchthreadid_uda notmuchstate_uda notmuchmsgid_uda
   export trigger_tag pending_tag done_tag deleted_tag
   export remove_on_pending remove_on_done remove_on_deleted
   export sync_on_modify sync_tags_on_modify sync_description_on_launch
@@ -244,24 +245,32 @@ notmuch_task::task() {
 }
 
 # Build a single TW-style JSON task record (compact, no trailing newline)
-# from one `flat` notmuch record line. The UUID is the deterministic value
-# derived from the bare message-id, so the same id yields the same UUID on
-# every import. The `entry` field is the message's Date header when
-# available (notmuch_task::fetch_messages enriches it), otherwise the
-# caller-supplied "now". `modified` is always the import moment. Optional
-# fields (project, notmuchid UDA, notmuchstate UDA, notmuchmsgid UDA) are
-# added conditionally. Status is always "pending": Taskwarrior is
-# authoritative for state, so a message's notmuch tags never decide the
-# imported task's status. Returns 1 when the id is empty or the UUID
-# derivation itself fails.
+# from one `flat` notmuch record line. The UUID is the deterministic
+# value derived from the THREAD id (one task per matching thread), so
+# the same thread-id yields the same UUID on every import even as
+# messages arrive, change, or rotate within the thread. The `id` from
+# the flat record is the root message-id of that thread and is stored
+# in the `notmuchid` UDA so on-modify can run `notmuch tag -- id:` on
+# a specific message. The `entry` field is the root message's Date
+# header when available (notmuch_task::fetch_messages enriches it),
+# otherwise the caller-supplied "now". `modified` is always the import
+# moment. Optional fields (project, notmuchid UDA, notmuchthreadid UDA,
+# notmuchstate UDA, notmuchmsgid UDA) are added conditionally. Status
+# is always "pending": Taskwarrior is authoritative for state, so a
+# message's notmuch tags never decide the imported task's status.
+# Returns 1 when the thread-id is empty or the UUID derivation fails.
 notmuch_task::notmuch_to_task_import_record() {
   local flat="$1" now_ts="$2"
-  local id subject date_iso entry_ts modified_ts proj full_id state_tag uuid_str
+  local id thread_id subject date_iso entry_ts modified_ts proj full_id state_tag uuid_str
+
+  thread_id=$(printf '%s' "$flat" | jq -r '.thread // ""')
+  [ -n "$thread_id" ] || return 1
 
   id=$(printf '%s' "$flat" | jq -r '.id // ""')
-  [ -n "$id" ] || return 1
 
-  uuid_str=$(notmuch_task::msgid_to_uuid "$id")
+  # UUID from the THREAD id so re-imports of the same thread re-bind to
+  # the same task even after messages within the thread churn.
+  uuid_str=$(notmuch_task::msgid_to_uuid "$thread_id")
   [ -n "$uuid_str" ] || return 1
 
   subject=$(printf '%s' "$flat" | jq -r '.subject // ""')
@@ -298,8 +307,9 @@ notmuch_task::notmuch_to_task_import_record() {
     [ -z "$proj" ] && proj="$project"
   fi
 
-  # Full RFC 5322 id (with angle brackets) is informational only.
-  full_id="<${id}>"
+  # Full RFC 5322 root-message id (with angle brackets) is informational only.
+  full_id=""
+  [ -n "$id" ] && full_id="<${id}>"
   state_tag=$(notmuch_task::state_for_tw_status "pending")
 
   # Compose optional fields with conditional jq additions. The
@@ -311,9 +321,11 @@ notmuch_task::notmuch_to_task_import_record() {
     --arg mod_ts "$modified_ts" \
     --arg proj "$proj" \
     --arg mid "$id" \
+    --arg tid "$thread_id" \
     --arg full_id "$full_id" \
     --arg state_tag "$state_tag" \
     --arg id_uda "$notmuchid_uda" \
+    --arg thread_uda "$notmuchthreadid_uda" \
     --arg state_uda "$notmuchstate_uda" \
     --arg full_uda "$notmuchmsgid_uda" \
     '{
@@ -325,6 +337,7 @@ notmuch_task::notmuch_to_task_import_record() {
     }
     + (if $proj != "" then {project: $proj} else {} end)
     + (if $mid != "" and $id_uda != "" then {($id_uda): $mid} else {} end)
+    + (if $tid != "" and $thread_uda != "" then {($thread_uda): $tid} else {} end)
     + (if $full_id != "" and $full_uda != "" then {($full_uda): $full_id} else {} end)
     + (if $state_tag != "" and $state_uda != "" then {($state_uda): $state_tag} else {} end)'
 }
@@ -391,45 +404,39 @@ notmuch_task::fetch_messages() {
   fi
 
   local raw
-  raw=$("$notmuch_bin" search --output=messages --format=json "$query" 2>/dev/null) || return 1
+  raw=$("$notmuch_bin" search --output=threads --format=json "$query" 2>/dev/null) || return 1
 
-  local recs=() id rec flat
-  # Per-message `notmuch show id:<id>` enrichment is ALWAYS performed.
-  # The email Subject is the task's description, so the show call is
-  # not opt-in: a task with no description defeats the hook's purpose.
-  # init_age_from_notmuch only controls whether the harvested Date
-  # header is mirrored to the task's `entry`; the show call itself is
-  # always made. project_tag_prefix (when set) is also driven from the
-  # same `tags` array returned by the show call, so this single
-  # per-message show call feeds both age and project_tag_prefix paths.
-  while IFS= read -r id; do
-    [ -z "$id" ] && continue
+  local recs=() thread_id rec flat
+  # One task per matching THREAD. `notmuch search --output=threads` gives
+  # us the thread-id set; `notmuch show thread:<id>` gives us the thread
+  # tree. Harvesting the root message object via `..`+`first` lets us
+  # ignore reply messages and pick exactly one record per thread (the
+  # root carries the Subject, From, Date, and tags). For matched root
+  # messages notmuch returns `match: true`; we pick the first message
+  # object whose id looks like an email id (`<...>@...`) so a degenerate
+  # reply-only thread still resolves to the first message present.
+  while IFS= read -r thread_id; do
+    [ -z "$thread_id" ] && continue
     rec=""
     local show_json
-    show_json=$("$notmuch_bin" show --format=json "id:$id" 2>/dev/null) || show_json=""
+    show_json=$("$notmuch_bin" show --format=json "thread:$thread_id" 2>/dev/null) || show_json=""
     if [ -n "$show_json" ]; then
-      # notmuch 0.40's `show --format=json id:<id>` puts the Subject
-      # inside `headers.Subject` rather than at the top level (the
-      # top-level `subject` is null on a single-id show query), so we
-      # fall through to `headers.Subject` when `.subject` is absent.
-      # Restrict matches to string-id objects so MIME-part ids (1, 2,
-      # 3) can't match, and pick `first` to dedupe across nested
-      # `children` / `reply-headers` shapes.
-      rec=$(printf '%s' "$show_json" | jq -c --arg id "$id" \
-        '[.. | objects | select((.id | type) == "string" and .id == $id)] | first // {} |
-         {id: $id,
-          subject: ((.subject // .headers.Subject // "") // ""),
-          from: ((.authors // .headers.From // "") // ""),
+      rec=$(printf '%s' "$show_json" | jq -c --arg tid "$thread_id" \
+        '[.. | objects | select(((.id|type) == "string") and (.id|contains("@")))] | first // {} |
+         {id: .id,
+          thread: $tid,
+          subject: (.subject // .headers.Subject // ""),
+          from: (.authors // .headers.From // ""),
           date: (.headers.Date // ""),
           tags: (.tags // [])}' \
         2>/dev/null) || rec=""
     fi
-    # Fall back to a bare-id record when the show call failed; the
-    # message still imports (entry=now, no subject). --arg keeps the
-    # id JSON-encoded exactly once (a manual `{"id":"$id"}` splice
-    # would double-encode).
+    # Fall back to a thread-id-only record when the show call failed;
+    # the thread still imports (entry=now, no subject) but with no
+    # usable root message-id we leave `id` empty so on-modify won't
+    # accidentally tag the wrong message.
     if [ -z "$rec" ]; then
-      rec=$(jq -c -n --arg id "$id" '{id: $id}')
+      rec=$(jq -c -n --arg tid "$thread_id" '{thread: $tid, id: "", subject: "", from: "", date: "", tags: []}')
     fi
     recs+=("$rec")
   done < <(printf '%s' "$raw" | jq -r '.[]' 2>/dev/null)

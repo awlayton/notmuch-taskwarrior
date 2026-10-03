@@ -78,19 +78,20 @@ if [ "${#config_files[@]}" -eq 0 ]; then
   exit 0
 fi
 
-# --- Index existing tasks by notmuchid UDA once ------------------------------
+# --- Index existing tasks by notmuchthreadid UDA once ------------------------
 # All statuses are exported and indexed (not just pending/completed) so a
-# deleted or waiting task with a notmuchid is still matched and never mirrored
-# a second time. TW 3.x ignores status filters on `export`, so filtering
-# happens in jq instead. The default UDA name is used here because no config
-# has been sourced yet; all configs are expected to share the UDA name.
+# deleted or waiting task with a notmuchthreadid is still matched and never
+# mirrored a second time. TW 3.x ignores status filters on `export`, so
+# filtering happens in jq instead. The default UDA name is used here because
+# no config has been sourced yet; all configs are expected to share the UDA
+# name.
 existing_json=$(notmuch_task::task export rc.json.array=on 2>/dev/null || true)
-existing_keys_jq=$(printf '%s' "$existing_json" | jq -c --arg kd "${notmuchid_uda:-notmuchid}" \
+existing_keys_jq=$(printf '%s' "$existing_json" | jq -c --arg kd "${notmuchthreadid_uda:-notmuchthreadid}" \
   '[.[] | select(.[$kd] != null and .[$kd] != "") | {key: .[$kd], uuid, status, description}] | unique_by(.key)' \
   2>/dev/null || printf '%s\n' "[]")
 
-# Dedupe by message-id across configs: this hook run processes each id at
-# most once regardless of how many configs surface it. (Typically configs
+# Dedupe by thread-id across configs: this hook run processes each thread
+# at most once regardless of how many configs surface it. (Typically configs
 # target non-overlapping queries, so dedupe is rarely needed; we keep it
 # for safety.)
 declare -A seen
@@ -115,16 +116,17 @@ for config_path in "${config_files[@]}"; do
 
   while IFS= read -r issue; do
     [ -z "$issue" ] && continue
-    id=$(printf '%s' "$issue" | jq -r '.id // ""')
-    [ -z "$id" ] && continue
-    if [ -n "${seen[$id]:-}" ]; then
+    thread_id=$(printf '%s' "$issue" | jq -r '.thread // ""')
+    [ -z "$thread_id" ] && continue
+    if [ -n "${seen[$thread_id]:-}" ]; then
       continue
     fi
-    seen[$id]=1
+    seen[$thread_id]=1
 
+    id=$(printf '%s' "$issue" | jq -r '.id // ""')
     subject=$(printf '%s' "$issue" | jq -r '.subject // ""')
 
-    matched_uuid=$(printf '%s' "$existing_keys_jq" | jq -r --arg k "$id" \
+    matched_uuid=$(printf '%s' "$existing_keys_jq" | jq -r --arg k "$thread_id" \
       '.[] | select(.key == $k) | .uuid' 2>/dev/null | head -n 1)
 
     if [ -z "$matched_uuid" ]; then
@@ -136,7 +138,7 @@ for config_path in "${config_files[@]}"; do
         issue=$(printf '%s' "$issue" | jq -c --arg p "$project" '. + {project: $p}')
       fi
       new_issues+=("$issue")
-      notmuch_task::log "queued $id for import: $subject"
+      notmuch_task::log "queued $thread_id (root=$id) for import: $subject"
       continue
     fi
 
@@ -161,7 +163,7 @@ for config_path in "${config_files[@]}"; do
       msg_state="deleted"
     fi
     if [ "$msg_state" != "$current_status" ]; then
-      notmuch_task::log "warning: $id state tag implies '$msg_state' but task is '$current_status'; not pushed (TW is authoritative)"
+      notmuch_task::log "warning: $thread_id state tag implies '$msg_state' but task is '$current_status'; not pushed (TW is authoritative)"
     fi
 
     # The email Subject is the source of truth for the description; set

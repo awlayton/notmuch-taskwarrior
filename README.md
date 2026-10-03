@@ -14,7 +14,7 @@ list.
 | ------ | ------ | ----------- |
 | `hooks/on-launch.notmuch-task` | before every `task` |
 | invocation | notmuch -> Taskwarrior (mirror, with deterministic |
-| UUIDs) |   | `hooks/on-modify.notmuch-task` | after every task |
+| UUIDs) | | `hooks/on-modify.notmuch-task` | after every task |
 | edit | Taskwarrior -> notmuch (push |
 | tags) |
 
@@ -186,7 +186,7 @@ task edits back to notmuch (on-modify
 | --- |
 | `sync_tags_on_modify` | `0` | Push |
 tag changes as notmuch tag add/remove.
-| **Off |  by default.** \| \| |
+| **Off | by default.** \| \| |
 | --- | --- |
 `sync_description_on_launch` | `1` | Mirror message Subjects over local
 description edits on launch.
@@ -347,9 +347,11 @@ it is not mirrored twice, and the mirror task keeps its state.
   is passed through locally but never written to the message.
   on-modify reports the skip; on-launch will re-sync the description to the
   Subject on the next invocation unless `sync_description_on_launch=0`.
-- `init_age_from_notmuch=0` skips the per-message `notmuch show` enrichment
-  entirely, so imported tasks get no Subject-derived description either — they
-  are bare `notmuchid` tasks with `entry` at the import moment.
+- `init_age_from_notmuch=0` skips the date → `entry` translation only; the
+  per-thread `notmuch show` enrichment still runs so the new task's description
+  is always the email Subject.
+  Imported tasks with `init_age_from_notmuch=0` simply get `entry =
+  <import-time>` rather than the email's age.
 - The launch hook runs before **every** `task` command (including reports), so
   it adds a small notmuch round-trip to each invocation.
   Slow down your `query` rather than mirroring the whole index.
@@ -359,4 +361,3 @@ it is not mirrored twice, and the mirror task keeps its state.
   never recurse and never emit color codes.
 - Test with `bash tests/test-notmuch-task.bash` (stubs `notmuch`, throws away
   `TASKDATA`).
-
