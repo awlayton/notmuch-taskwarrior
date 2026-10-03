@@ -1,0 +1,9 @@
+# notmuch-task UDA definitions. Append these lines to ~/.taskrc (or point a
+# TASKRC file at this file). The hook-internal `task` calls always run with
+# rc.color=no and rc.hooks=off so they never recurse and never add color codes.
+uda.notmuchid.type=string
+uda.notmuchid.label=Notmuch Message-ID
+uda.notmuchstate.type=string
+uda.notmuchstate.label=Notmuch State
+uda.notmuchmsgid.type=string
+uda.notmuchmsgid.label=Notmuch RFC822 Message-ID

@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+#
+# on-launch.notmuch-task -- Taskwarrior on-launch hook.
+#
+# Iterates over every config file in the bundle's `notmuch-task/config.d/`
+# (next to the installed hooks) or in `$NOTMUCH_TASK_CONFIG_DIR` if set;
+# each file is a whole config and may target a distinct notmuch query,
+# project, or tag set. For each config it fetches the matching message
+# snapshot via `notmuch` and reconciles the local task list. New messages
+# are batched into one `task import` call whose records carry the
+# deterministic UUID derived from their message-id. Matched tasks have
+# their description reconciled to the message Subject in place. State is
+# NOT pushed back from notmuch to Taskwarrior: Taskwarrior is
+# authoritative for state, so a message whose state tags disagree with
+# the task's status only logs a soft warning. Deleted or waiting tasks
+# that carry a notmuchid are left untouched (never re-added, never
+# clobbered). The same message-id is processed at most once across all
+# configs (de-duplicated by an in-memory id set).
+#
+# Input:  none (stdin is not read).
+# Output: no JSON on stdout; feedback lines on stderr.
+# Exit:   0 on success (or graceful degradation such as a per-config
+#         notmuch fetch failure or an unloadable individual config); 1
+#         only when the config directory itself is missing.
+#
+# Synopsis:
+#   installed as  <hooks.location>/on-launch.notmuch-task  (executable)
+#   invoked by Taskwarrior (v2 hook args): api:2 args:... command:... rc:...
+#   data:... version:...
+set -u
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=notmuch-task/lib/notmuch-task-lib.bash
+source "$SELF_DIR/notmuch-task/lib/notmuch-task-lib.bash"
+
+# Hooks API v2 hands us api:2 plus rc:/data:/command:/version:... args. We
+# consume them so internal `task` calls see the exact config in effect and
+# so we can skip mirroring when the user is already mid-add or mid-import
+# (which would race their task's UUID assignment).
+NOTMUCH_TASK_DATA_DIR=""
+NOTMUCH_TASK_RC=""
+NOTMUCH_TASK_HOOK_COMMAND=""
+for arg in "$@"; do
+  case "$arg" in
+  data:*) NOTMUCH_TASK_DATA_DIR="${arg#data:}" ;;
+  rc:*) NOTMUCH_TASK_RC="${arg#rc:}" ;;
+  command:*) NOTMUCH_TASK_HOOK_COMMAND="${arg#command:}" ;;
+  esac
+done
+: "${NOTMUCH_TASK_DATA_DIR:=${TASKDATA:-${XDG_DATA_HOME:-$HOME/.local/share}/task}}"
+
+# Skip mirroring while the user is mid-add or mid-import. Mirroring in those
+# contexts would race the user's task: the user's just-saved task may not
+# yet be visible to our `task export` (we read via rc.hooks=off before the
+# user's commit lands), so on-launch would mirror a *second* task for the
+# same message-id. New messages still get mirrored at the NEXT
+# `task list`/`task next`/etc invocation, which is the typical cadence.
+case "${NOTMUCH_TASK_HOOK_COMMAND:-}" in
+add | import)
+  exit 0
+  ;;
+esac
+
+# --- Config discovery --------------------------------------------------------
+# Default config dir is the bundle's own `notmuch-task/config.d/` next to
+# this hook, so hooks + lib + taskrc + configs all co-locate under one XDG
+# path (the installer's `$HOOK_DEST`). Override with $NOTMUCH_TASK_CONFIG_DIR
+# to put configs anywhere else.
+bundle_dir="$SELF_DIR/notmuch-task"
+config_dir="${NOTMUCH_TASK_CONFIG_DIR:-$bundle_dir/config.d}"
+[ -d "$config_dir" ] || {
+  notmuch_task::die "config dir not found: $config_dir"
+}
+
+mapfile -t config_files < <(notmuch_task::list_config_files "$config_dir")
+if [ "${#config_files[@]}" -eq 0 ]; then
+  notmuch_task::log "no *.conf/*.bash files in $config_dir; nothing to mirror"
+  exit 0
+fi
+
+# --- Index existing tasks by notmuchid UDA once ------------------------------
+# All statuses are exported and indexed (not just pending/completed) so a
+# deleted or waiting task with a notmuchid is still matched and never mirrored
+# a second time. TW 3.x ignores status filters on `export`, so filtering
+# happens in jq instead. The default UDA name is used here because no config
+# has been sourced yet; all configs are expected to share the UDA name.
+existing_json=$(notmuch_task::task export rc.json.array=on 2>/dev/null || true)
+existing_keys_jq=$(printf '%s' "$existing_json" | jq -c --arg kd "${notmuchid_uda:-notmuchid}" \
+  '[.[] | select(.[$kd] != null and .[$kd] != "") | {key: .[$kd], uuid, status, description}] | unique_by(.key)' \
+  2>/dev/null || printf '%s\n' "[]")
+
+# Dedupe by message-id across configs: this hook run processes each id at
+# most once regardless of how many configs surface it. (Typically configs
+# target non-overlapping queries, so dedupe is rarely needed; we keep it
+# for safety.)
+declare -A seen
+new_issues=()
+
+# --- Per-config iteration ----------------------------------------------------
+for config_path in "${config_files[@]}"; do
+  if ! notmuch_task::source_config_file "$config_path"; then
+    notmuch_task::log "skipping config (source failed): $config_path"
+    continue
+  fi
+  if ! notmuch_task::require_notmuch; then
+    notmuch_task::log "skipping config (notmuch check failed): $config_path"
+    continue
+  fi
+  notmuch_task::log "processing config: $config_path (query='${query:-}')"
+
+  snapshot=$(notmuch_task::fetch_messages) || {
+    notmuch_task::log "notmuch fetch failed for $config_path; continuing"
+    continue
+  }
+
+  while IFS= read -r issue; do
+    [ -z "$issue" ] && continue
+    id=$(printf '%s' "$issue" | jq -r '.id // ""')
+    [ -z "$id" ] && continue
+    if [ -n "${seen[$id]:-}" ]; then
+      continue
+    fi
+    seen[$id]=1
+
+    subject=$(printf '%s' "$issue" | jq -r '.subject // ""')
+
+    matched_uuid=$(printf '%s' "$existing_keys_jq" | jq -r --arg k "$id" \
+      '.[] | select(.key == $k) | .uuid' 2>/dev/null | head -n 1)
+
+    if [ -z "$matched_uuid" ]; then
+      # Defer until end of loop; we'll batch-import once below.
+      # Bake the per-config $project into the flat record so the batched
+      # `task import` later doesn't inherit a later config's values just
+      # because we ran past this config's iteration.
+      if [ -n "$project" ]; then
+        issue=$(printf '%s' "$issue" | jq -c --arg p "$project" '. + {project: $p}')
+      fi
+      new_issues+=("$issue")
+      notmuch_task::log "queued $id for import: $subject"
+      continue
+    fi
+
+    # Matched task: reconcile only the description. State is NOT pushed
+    # back from notmuch (Taskwarrior is authoritative for state).
+    current_status=$(printf '%s' "$existing_keys_jq" | jq -r --arg u "$matched_uuid" \
+      '.[] | select(.uuid == $u) | .status' 2>/dev/null | head -n 1)
+    case "$current_status" in
+    pending | completed) ;;
+    *) continue ;;
+    esac
+
+    # The message's own state tags may imply a different state than the
+    # task's status (e.g. a message still tagged task-done while the task
+    # was reopened). Log a soft warning and leave the task alone; the
+    # user can reconcile manually.
+    tags_csv=$(printf '%s' "$issue" | jq -r '.tags // [] | join(",")')
+    msg_state="pending"
+    if notmuch_task::in_list "$done_tag" "$tags_csv"; then
+      msg_state="completed"
+    elif notmuch_task::in_list "$deleted_tag" "$tags_csv"; then
+      msg_state="deleted"
+    fi
+    if [ "$msg_state" != "$current_status" ]; then
+      notmuch_task::log "warning: $id state tag implies '$msg_state' but task is '$current_status'; not pushed (TW is authoritative)"
+    fi
+
+    # The email Subject is the source of truth for the description; set
+    # sync_description_on_launch=0 to keep locally-edited descriptions.
+    current_desc=$(printf '%s' "$existing_keys_jq" | jq -r --arg u "$matched_uuid" \
+      '.[] | select(.uuid == $u) | .description' 2>/dev/null | head -n 1)
+    if [ "${sync_description_on_launch:-1}" = "1" ] && [ -n "$subject" ] && [ "$current_desc" != "$subject" ]; then
+      if notmuch_task::task "$matched_uuid" modify "description:$subject" >/dev/null 2>&1; then
+        notmuch_task::log "updated $id description"
+      else
+        notmuch_task::log "failed to update $id description"
+      fi
+    fi
+  done < <(printf '%s' "$snapshot" | jq -c '.[]')
+done
+
+# --- Bulk import ------------------------------------------------------------
+# Importing in one `task import` call is one inner Taskwarrior process; that
+# inner process re-fires on-launch but its `command:import` makes our skip
+# clause above handle the recursion safely.
+#
+# on-launch is observation-only: it NEVER writes to notmuch. The trigger
+# tag (`todo` by default) stays on the message until the user changes the
+# task's state in Taskwarrior, at which point on-modify writes the new
+# notmuch tags (see notmuch_task::apply_state_tags). Re-imports of an
+# already-mirrored message are harmless: the deterministic UUID (and the
+# existing_keys_jq index) match the existing task, so no duplicate task
+# is created even though the message keeps its trigger tag across the
+# on-launch pass.
+if [ "${#new_issues[@]}" -gt 0 ]; then
+  if printf '%s\n' "${new_issues[@]}" | notmuch_task::task_import_records; then
+    notmuch_task::log "imported ${#new_issues[@]} task(s) from ${#config_files[@]} config(s)"
+  else
+    notmuch_task::log "failed to import ${#new_issues[@]} notmuch task(s)"
+  fi
+fi
+
+exit 0

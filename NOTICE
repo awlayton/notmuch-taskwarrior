@@ -1,0 +1,22 @@
+NOTICE — AI-written, unowned code
+==================================
+
+This codebase is the output of an AI coding session. The shell scripts,
+bash library, configuration templates, documentation, layout decisions,
+tests, and trade-offs were produced with light human direction; the human
+reviewer does **not** claim authorship or ownership of any of it.
+
+Concretely:
+
+- No individual or organization is the author. Treat the code as a
+  disposable draft. Anyone is free to copy it, modify it, republish it,
+  vendor it, throw it away, or rewrite it from scratch.
+- The MIT licence in `LICENSE` covers the code with no warranty and no
+  attribution requirement beyond the licence notice itself.
+- The repository is provided "as is" — see the licence's warranty
+  disclaimer. The author(s) accept no liability arising from its use.
+- If a bug bites you, an AI assistant can regenerate a fix just as
+  quickly as the original code was generated.
+
+There is no CLA, no contributor agreement, and no chain of authorship.
+The combination of `LICENSE` + this file is the entire contract.

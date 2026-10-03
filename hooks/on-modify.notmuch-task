@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+#
+# on-modify.notmuch-task -- Taskwarrior on-modify hook.
+#
+# Pushes Taskwarrior edits back to notmuch (via `notmuch tag`) for tasks
+# that carry the notmuchid UDA. Configs are iterated alphabetically from
+# `notmuch-task/config.d/` (or `$NOTMUCH_TASK_CONFIG_DIR`); the LAST
+# sourced config's `sync_on_modify`, state tags, and UDA names win (so
+# users can override defaults in a final `99-overrides.conf`). Status
+# changes become notmuch tag transitions (pending/completed/deleted map
+# to task-pending/task-done/task-deleted via apply_state_tags, and the
+# notmuchstate UDA is updated in the emitted JSON). Description edits
+# cannot be pushed (notmuch has no message edit) and are reported as
+# skipped so users understand why local edits don't propagate. Tag changes
+# become notmuch tag add/remove calls (only when sync_tags_on_modify=1).
+# The hook never vetoes: it always exits 0 and echoes the (possibly
+# updated) modified task JSON as the first stdout line.
+#
+# Input:  line 1 = original task JSON, line 2 = modified task JSON (read with
+#         `read -r` so backslashes are preserved).
+# Output: line 1 = modified task JSON (the notmuchstate UDA is updated when a
+#         status change was synced); subsequent lines = feedback.
+# Exit:   always 0 (fail-open; a broken config or missing jq still passes the
+#         modification through untouched).
+#
+# Synopsis:
+#   installed as  <hooks.location>/on-modify.notmuch-task  (executable)
+#   invoked by Taskwarrior (v2 hook args): api:2 args:... command:... rc:...
+#   data:... version:...
+set -u
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=notmuch-task/lib/notmuch-task-lib.bash
+source "$SELF_DIR/notmuch-task/lib/notmuch-task-lib.bash"
+
+NOTMUCH_TASK_DATA_DIR=""
+NOTMUCH_TASK_RC=""
+for arg in "$@"; do
+  case "$arg" in
+  data:*) NOTMUCH_TASK_DATA_DIR="${arg#data:}" ;;
+  rc:*) NOTMUCH_TASK_RC="${arg#rc:}" ;;
+  esac
+done
+
+IFS= read -r original || original=""
+IFS= read -r modified || modified=""
+[ -z "$modified" ] && exit 0
+
+# Fail open when jq is missing: pass the modification through untouched.
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' "$modified"
+  exit 0
+fi
+
+# --- Config discovery --------------------------------------------------------
+# Default config dir is the bundle's own `notmuch-task/config.d/` next to
+# this hook, so hooks + lib + taskrc + configs all co-locate under one XDG
+# path (the installer's `$HOOK_DEST`). Override with $NOTMUCH_TASK_CONFIG_DIR
+# to put configs anywhere else.
+#
+# Iterate every config file (last-wins alphabetical). A missing config dir
+# or empty dir means there's no sync-on-modify behavior to apply -- pass
+# the modification through cleanly. Per-config sourcing failures are
+# logged but do not abort; late-iteration failures just override earlier
+# values with defaults if they don't address the failing key.
+bundle_dir="$SELF_DIR/notmuch-task"
+config_dir="${NOTMUCH_TASK_CONFIG_DIR:-$bundle_dir/config.d}"
+if [ -d "$config_dir" ]; then
+  any_loaded=0
+  while IFS= read -r config_path; do
+    [ -z "$config_path" ] && continue
+    if notmuch_task::source_config_file "$config_path" 2>/dev/null; then
+      any_loaded=1
+    else
+      notmuch_task::log "skipping config (source failed): $config_path"
+    fi
+  done < <(notmuch_task::list_config_files "$config_dir")
+fi
+
+# Honour the LAST config's sync_on_modify. With no config loaded we fall
+# back to defaults (sync_on_modify=0 from set_config_defaults).
+if [ "${sync_on_modify:-0}" != "1" ]; then
+  printf '%s\n' "$modified"
+  exit 0
+fi
+
+# Only tasks that carry the notmuchid UDA are synced back.
+id=$(printf '%s' "$modified" | jq -r --arg k "${notmuchid_uda:-notmuchid}" '.[$k] // ""')
+if [ -z "$id" ]; then
+  printf '%s\n' "$modified"
+  exit 0
+fi
+
+orig_status=$(printf '%s' "$original" | jq -r '.status // ""')
+new_status=$(printf '%s' "$modified" | jq -r '.status // ""')
+orig_desc=$(printf '%s' "$original" | jq -r '.description // ""')
+new_desc=$(printf '%s' "$modified" | jq -r '.description // ""')
+orig_tags=$(printf '%s' "$original" | jq -r '.tags // [] | join(",")')
+new_tags=$(printf '%s' "$modified" | jq -r '.tags // [] | join(",")')
+
+modified_out="$modified"
+feed=()
+
+# --- Status: task state changes map to notmuch tag transitions ---------------
+if [ "$orig_status" = "pending" ] && [ "$new_status" = "completed" ]; then
+  st=$(notmuch_task::state_for_tw_status "completed")
+  if notmuch_task::apply_state_tags "$id" "completed"; then
+    modified_out=$(printf '%s' "$modified_out" | jq -c --arg k "${notmuchstate_uda:-notmuchstate}" --arg v "$st" '.[$k] = $v')
+    feed+=("Synced $id: status pending -> $st")
+  else
+    feed+=("Sync FAILED for $id: tag transition to $st")
+  fi
+elif [ "$orig_status" = "completed" ] && [ "$new_status" = "pending" ]; then
+  st=$(notmuch_task::state_for_tw_status "pending")
+  if notmuch_task::apply_state_tags "$id" "pending"; then
+    modified_out=$(printf '%s' "$modified_out" | jq -c --arg k "${notmuchstate_uda:-notmuchstate}" --arg v "$st" '.[$k] = $v')
+    feed+=("Synced $id: status completed -> $st")
+  else
+    feed+=("Sync FAILED for $id: tag transition to $st")
+  fi
+elif [ "$orig_status" = "pending" ] && [ "$new_status" = "deleted" ]; then
+  st=$(notmuch_task::state_for_tw_status "deleted")
+  if notmuch_task::apply_state_tags "$id" "deleted"; then
+    modified_out=$(printf '%s' "$modified_out" | jq -c --arg k "${notmuchstate_uda:-notmuchstate}" --arg v "$st" '.[$k] = $v')
+    feed+=("Synced $id: status pending -> $st")
+  else
+    feed+=("Sync FAILED for $id: tag transition to $st")
+  fi
+elif [ "$orig_status" = "deleted" ] && [ "$new_status" = "pending" ]; then
+  st=$(notmuch_task::state_for_tw_status "pending")
+  if notmuch_task::apply_state_tags "$id" "pending"; then
+    modified_out=$(printf '%s' "$modified_out" | jq -c --arg k "${notmuchstate_uda:-notmuchstate}" --arg v "$st" '.[$k] = $v')
+    feed+=("Synced $id: status deleted -> $st")
+  else
+    feed+=("Sync FAILED for $id: tag transition to $st")
+  fi
+fi
+
+# --- Description: notmuch has no message edit --------------------------------
+# notmuch cannot rewrite a message's Subject header, so description edits
+# never propagate. Report the skip so users understand why.
+if [ "$orig_desc" != "$new_desc" ]; then
+  feed+=("Sync SKIPPED for $id: description edit (notmuch has no edit)")
+fi
+
+# --- Tags: optional tag sync (off by default) --------------------------------
+if [ "${sync_tags_on_modify:-0}" = "1" ] && [ "$orig_tags" != "$new_tags" ]; then
+  o_arr=()
+  n_arr=()
+  IFS=',' read -r -a o_arr <<< "$orig_tags"
+  IFS=',' read -r -a n_arr <<< "$new_tags"
+  added=()
+  removed=()
+  t=""
+  o=""
+  n=""
+  in_orig=0
+  in_new=0
+  for t in "${n_arr[@]}"; do
+    [ -n "$t" ] || continue
+    in_orig=0
+    for o in "${o_arr[@]}"; do
+      [ "$o" = "$t" ] && in_orig=1
+    done
+    [ "$in_orig" -eq 0 ] && added+=("$t")
+  done
+  for t in "${o_arr[@]}"; do
+    [ -n "$t" ] || continue
+    in_new=0
+    for n in "${n_arr[@]}"; do
+      [ "$n" = "$t" ] && in_new=1
+    done
+    [ "$in_new" -eq 0 ] && removed+=("$t")
+  done
+  if [ "${#added[@]}" -gt 0 ] || [ "${#removed[@]}" -gt 0 ]; then
+    tag_args=()
+    for t in "${added[@]}"; do
+      tag_args+=("+$t")
+    done
+    for t in "${removed[@]}"; do
+      tag_args+=("-$t")
+    done
+    if "${notmuch_bin:-notmuch}" tag "${tag_args[@]}" -- "id:$id" >/dev/null 2>&1; then
+      feed+=("Synced $id: tags updated")
+    else
+      feed+=("Sync FAILED for $id: tag edit")
+    fi
+  fi
+fi
+
+# The modified task JSON must be the FIRST stdout line; everything after is
+# feedback that Taskwarrior displays as footnotes.
+printf '%s\n' "$modified_out"
+[ "${#feed[@]}" -gt 0 ] && printf '%s\n' "${feed[@]}"
+exit 0

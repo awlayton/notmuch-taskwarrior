@@ -1,0 +1,8 @@
+# Editor cruft
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Scratch / test output
+_tmp/
